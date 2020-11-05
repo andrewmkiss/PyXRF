@@ -1,5 +1,3 @@
-__author__ = 'Li Li'
-
 param_data = {
     "coherent_sct_amplitude": {
         "adjust_element1": "fixed",
@@ -27,7 +25,7 @@ param_data = {
         "linear": "fixed",
         "max": 13.0,
         "min": 9.0,
-        "default": 10.0,
+        "default": 12.0,
         "value": 12.0
     },
     "compton_amplitude": {
@@ -203,7 +201,8 @@ param_data = {
         "linear": "fixed",
         "max": 0.0002,
         "min": 1e-05,
-        "tool_tip": "width**2 = (b1/2.3548)**2 + 3.85*b2*E, 3.85keV is electron-hole pair creation energy in silicon",
+        "tool_tip": ("width**2 = (b1/2.3548)**2 + 3.85*b2*E, 3.85keV is "
+                     "electron-hole pair creation energy in silicon"),
         "default": 0.000114,
         "value": 0.000114
     },
@@ -226,12 +225,12 @@ param_data = {
     "non_fitting_values": {
         "element_list": "Al_K, S_K, Cl_K, Ar_K, Ca_K, Cr_K, Fe_K, Co_K, Ni_K, Cu_K, Pm_L, Gd_L",
         "energy_bound_high": {
-            "default_value": 13.5,
+            "default_value": 12.8,
             "description": "E high [keV]",
             "value": 12.8
         },
         "energy_bound_low": {
-            "default_value": 1.5,
+            "default_value": 1.0,
             "description": "E low [keV]",
             "value": 1.0
         },

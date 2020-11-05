@@ -1,73 +1,46 @@
-# ######################################################################
-# Copyright (c) 2014, Brookhaven Science Associates, Brookhaven        #
-# National Laboratory. All rights reserved.                            #
-#                                                                      #
-# Redistribution and use in source and binary forms, with or without   #
-# modification, are permitted provided that the following conditions   #
-# are met:                                                             #
-#                                                                      #
-# * Redistributions of source code must retain the above copyright     #
-#   notice, this list of conditions and the following disclaimer.      #
-#                                                                      #
-# * Redistributions in binary form must reproduce the above copyright  #
-#   notice this list of conditions and the following disclaimer in     #
-#   the documentation and/or other materials provided with the         #
-#   distribution.                                                      #
-#                                                                      #
-# * Neither the name of the Brookhaven Science Associates, Brookhaven  #
-#   National Laboratory nor the names of its contributors may be used  #
-#   to endorse or promote products derived from this software without  #
-#   specific prior written permission.                                 #
-#                                                                      #
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS  #
-# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT    #
-# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS    #
-# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE       #
-# COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,           #
-# INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES   #
-# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR   #
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)   #
-# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,  #
-# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OTHERWISE) ARISING   #
-# IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE   #
-# POSSIBILITY OF SUCH DAMAGE.                                          #
-########################################################################
 from __future__ import absolute_import
-__author__ = 'Li Li'
 
 import numpy as np
 import time
 import copy
-import six
 import os
+import re
+import math
 from collections import OrderedDict, deque
 import multiprocessing
+import multiprocessing.pool
 import h5py
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import json
-from scipy.optimize import nnls
-from scipy.interpolate import interp1d, interp2d
 import lmfit
-#from enaml.qt.qt_application import QApplication
+import platform
+from distutils.version import LooseVersion
+import dask.array as da
 
 from atom.api import Atom, Str, observe, Typed, Int, List, Dict, Float, Bool
 from skbeam.core.fitting.xrf_model import (ModelSpectrum, update_parameter_dict,
-                                           sum_area, set_parameter_bound,
-                                           ParamController, K_LINE, L_LINE, M_LINE,
-                                           nnls_fit, trim, construct_linear_model,
-                                           linear_spectrum_fitting,
+                                           # sum_area,
+                                           set_parameter_bound,
+                                           # ParamController,
+                                           K_LINE, L_LINE, M_LINE,
+                                           nnls_fit, construct_linear_model,
+                                           # linear_spectrum_fitting,
                                            register_strategy, TRANSITIONS_LOOKUP)
-from skbeam.core.fitting.background import snip_method
 from skbeam.fluorescence import XrfElement as Element
 from .guessparam import (calculate_profile, fit_strategy_list,
                          trim_escape_peak, define_range, get_energy,
                          get_Z, PreFitStatus, ElementController,
                          update_param_from_element)
-from .fileio import save_fitdata_to_hdf, output_data, output_data_to_tiff
+from .fileio import save_fitdata_to_hdf, output_data
+
+from ..core.fitting import rfactor
+from ..core.quant_analysis import ParamQuantEstimation
+from ..core.map_processing import (fit_xrf_map, TerminalProgressBar,
+                                   prepare_xrf_map, snip_method_numba)
 
 import logging
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 
 
 class Fit1D(Atom):
@@ -85,6 +58,8 @@ class Fit1D(Atom):
         dict of 2D array map for each fitted element
     map_interpolation : bool
         option to interpolate the 2D map according to x,y position or not
+        Interpolation is performed only before exporting data
+        (currently .tiff or .txt)
     hdf_path : str
         path to hdf file
     hdf_name : str
@@ -94,9 +69,12 @@ class Fit1D(Atom):
     default_parameters = Dict()
     param_dict = Dict()
 
+    img_dict = Dict()
+    data_sets = Typed(OrderedDict)
+
     element_list = List()
     data_sets = Dict()
-    data_all = Typed(np.ndarray)
+    data_all = Typed(object)
     data = Typed(np.ndarray)
     fit_x = Typed(np.ndarray)
     fit_y = Typed(np.ndarray)
@@ -124,10 +102,17 @@ class Fit1D(Atom):
     cal_y = Typed(np.ndarray)
     cal_spectrum = Dict()
 
-    # attributes used by the ElementEdit window
-    #selected_element = Str()
+    #  attributes used by the ElementEdit window
+    selected_element = Str()
     selected_index = Int()
     elementinfo_list = List()
+
+    # The variable contains the image title displayed in "Element Map' tab.
+    #   The variable is synchronized with the identical variable in 'DrawImageAdvanced' class.
+    img_title = Str()
+    # Reference to the dictionary that contains dataset currently displayed in 'Element Map' tab
+    #   The variable is synchronized with the identical variable in 'DrawImageAdvanced' class
+    dict_to_plot = Dict()
 
     function_num = Int(0)
     nvar = Int(0)
@@ -165,8 +150,6 @@ class Fit1D(Atom):
     pixel_fit_method = Int(0)
     param_q = Typed(object)
 
-    x_data = Typed(np.ndarray)
-    y_data = Typed(np.ndarray)
     result_map = Dict()
     map_interpolation = Bool(False)
     hdf_path = Str()
@@ -176,13 +159,43 @@ class Fit1D(Atom):
     scaler_keys = List()
     scaler_index = Int(0)
 
-    def __init__(self, *args, **kwargs):
+    # Reference to GuessParamModel object
+    param_model = Typed(object)
+
+    # Reference to FileIOMOdel
+    io_model = Typed(object)
+
+    # Quantitative analysis: used during estimation step
+    param_quant_estimation = ParamQuantEstimation()
+    # *** The following two references are used exclusively to update the list of standards ***
+    # ***   in the dialog box. ***
+    qe_param_built_in_ref = Typed(object)
+    qe_param_custom_ref = Typed(object)
+    # The following reference used to track the selected standard while the selection
+    #   dialog box is open. Once the dialog box is opened again, the reference becomes
+    #   invalid, since the descriptions of the standards are reloaded from files.
+    qe_standard_selected_ref = Typed(object)
+    # Keep the actual copy of the selected standard. The copy is used to keep information
+    #   on the selected standard while descriptions are reloaded (references become invalid).
+    qe_standard_selected_copy = Typed(object)
+    # *** The following fields are used exclusively to store input values ***
+    # ***   for the 'SaveQuantCalibration' dialog box. ***
+    # *** The fields are not guaranteed to have valid values at any other time. ***
+    qe_standard_distance_to_sample = Float(0.0)
+
+    def __init__(self, param_model, io_model, *args, **kwargs):
         self.working_directory = kwargs['working_directory']
         self.result_folder = kwargs['working_directory']
         self.default_parameters = kwargs['default_parameters']
         self.param_dict = copy.deepcopy(self.default_parameters)
         self.param_q = deque()
         self.all_strategy = OrderedDict()
+
+        # Reference to GuessParamModel object
+        self.param_model = param_model
+
+        # Reference to FileIOMOdel
+        self.io_model = io_model
 
         self.EC = ElementController()
         self.pileup_data = {'element1': 'Si_K',
@@ -199,6 +212,9 @@ class Fit1D(Atom):
         self.roi_sum_opt['status'] = False
         self.roi_sum_opt['low'] = 0.0
         self.roi_sum_opt['high'] = 10.0
+
+        self.qe_standard_selected_ref = None
+        self.qe_standard_selected_copy = None
 
     def result_folder_changed(self, change):
         """
@@ -250,10 +266,17 @@ class Fit1D(Atom):
             This is the dictionary that gets passed to a function
             with the @observe decorator
         """
-        img_dict = change['value']
-        _key = [k for k in img_dict.keys() if 'scaler' in k]
+        self.img_dict = change['value']
+        _key = [k for k in self.img_dict.keys() if 'scaler' in k]
         if len(_key) != 0:
-            self.scaler_keys = sorted(img_dict[_key[0]].keys())
+            self.scaler_keys = sorted(self.img_dict[_key[0]].keys())
+
+    def data_sets_update(self, change):
+        """
+        Observer function to be connected to the fileio model
+        in the top-level gui.py startup
+        """
+        self.data_sets = change['value']
 
     def scaler_index_update(self, change):
         """
@@ -268,20 +291,96 @@ class Fit1D(Atom):
         """
         self.scaler_index = change['value']
 
+    def img_title_update(self, change):
+        r"""Observer function. Sets ``img_title`` field to the same value as
+        the identical variable in ``DrawImageAdvanced`` class"""
+        self.img_title = change['value']
+
+    def dict_to_plot_update(self, change):
+        r"""Observer function. Sets ``dict_to_plot`` field to the same value as
+        the identical variable in ``DrawImageAdvanced`` class"""
+        self.dict_to_plot = change['value']
+
+    def energy_bound_high_update(self, change):
+        """
+        Observer function that connects 'param_model' (GuessParamModel)
+        attribute 'energy_bound_high_buf' with the respective
+        value in 'self.param_dict'
+        """
+        self.param_dict['non_fitting_values']['energy_bound_high']['value'] = change['value']
+
+    def energy_bound_low_update(self, change):
+        """
+        Observer function that connects 'param_model' (GuessParamModel)
+        attribute 'energy_bound_low_buf' with the respective
+        value in 'self.param_dict'
+        """
+        self.param_dict['non_fitting_values']['energy_bound_low']['value'] = change['value']
+
+    def update_selected_index(self, selected_element=None,
+                              element_list_new=None):
+
+        if selected_element is None:
+            # Currently selected element
+            element = self.selected_element
+        else:
+            # Selected element (probably saved before update of the element list)
+            element = selected_element
+
+        if element_list_new is None:
+            # Current element list
+            element_list = self.element_list
+        else:
+            # Future element list (before it is updated)
+            element_list = element_list_new
+
+        if not element_list:
+            # Empty element list
+            ind = 0
+        else:
+            try:
+                # Combo-box has additional element 'Select element'
+                ind = element_list.index(element) + 1
+            except ValueError:
+                # Element is not found (was deleted), so deselect the element
+                ind = 0
+        if ind == self.selected_index:
+            # We want the content to update (deselect, then select again)
+            self.selected_index = 0
+        self.selected_index = ind
+
     @observe('selected_index')
     def _selected_element_changed(self, change):
         if change['value'] > 0:
-            selected_element = self.element_list[change['value']-1]
-            if len(selected_element) <= 4:
-                element = selected_element.split('_')[0]
+            ind_sel = change['value'] - 1
+            if ind_sel >= len(self.element_list):
+                ind_sel = len(self.element_list) - 1
+                self.selected_index = ind_sel + 1  # Change the selection as well
+            self.selected_element = self.element_list[ind_sel]
+            if len(self.selected_element) <= 4:
+                element = self.selected_element.split('_')[0]
                 self.elementinfo_list = sorted([e for e in list(self.param_dict.keys())
                                                 if (element+'_' in e) and  # error between S_k or Si_k
                                                 ('pileup' not in e)])  # Si_ka1 not Si_K
-                print(self.elementinfo_list)
+                logger.info(f"Element line info: {self.elementinfo_list}")
             else:
-                element = selected_element  # for pileup peaks
+                element = self.selected_element  # for pileup peaks
                 self.elementinfo_list = sorted([e for e in list(self.param_dict.keys())
                                                 if element.replace('-', '_') in e])
+                logger.info(f"User defined or pileup peak info: {self.elementinfo_list}")
+        else:
+            self.elementinfo_list = []
+
+    def select_index_by_eline_name(self, eline_name):
+        # Select the element by name. If element is selected, then the ``elementinfo_list`` with
+        #   names of parameters is created. Originally the element could only be selected
+        #   by its index in the list (from dialog box ``ElementEdit``. This function is
+        #   used by interface components for editing parameters of user defined peaks.
+        if eline_name in self.element_list:
+            # This will fill the list ``self.elementinfo_list``
+            self.selected_index = self.element_list.index(eline_name) + 1
+        else:
+            raise Exception(f"Line '{eline_name}' is not in the list of selected element lines.")
 
     def keep_size(self):
         """Keep the size of deque as 2.
@@ -300,7 +399,8 @@ class Fit1D(Atom):
         """
         with open(param_path, 'r') as json_data:
             self.default_parameters = json.load(json_data)
-        ### use queue to save the status of parameters
+
+        #  use queue to save the status of parameters
         self.param_q.append(copy.deepcopy(self.default_parameters))
         self.keep_size()
 
@@ -312,7 +412,7 @@ class Fit1D(Atom):
         param : dict
         """
         self.default_parameters = copy.deepcopy(param)
-        ### use queue to save the status of parameters
+        #  use queue to save the status of parameters
         self.param_q.append(copy.deepcopy(self.default_parameters))
         self.keep_size()
 
@@ -320,36 +420,46 @@ class Fit1D(Atom):
         """
         Update param_dict with default parameters, also update element list.
         """
-        self.param_dict = copy.deepcopy(self.default_parameters)
+        # Save currently selected element name
+        selected_element = self.selected_element
+        self.selected_index = 0
 
-        element_list = self.param_dict['non_fitting_values']['element_list']
-        self.element_list = [e.strip(' ') for e in element_list.split(',')]
+        element_list = self.default_parameters['non_fitting_values']['element_list']
+        element_list = [e.strip(' ') for e in element_list.split(',')]
+        element_list = [_ for _ in element_list if _]  # Get rid of empty strings in the list
+        self.element_list = element_list
+
+        self.param_dict = copy.deepcopy(self.default_parameters)
 
         # show the list of elements on add/remove window
         self.EC.delete_all()
         self.create_EC_list(self.element_list)
         self.update_name_list()
 
+        # Update the index in case the selected emission line disappeared from the list
+        self.update_selected_index(selected_element=selected_element,
+                                   element_list_new=element_list)
+
         # global parameters
         # for GUI purpose only
         # if we do not clear the list first, there is not update on the GUI
         self.global_param_list = []
-        self.global_param_list = sorted([k for k in six.iterkeys(self.param_dict)
+        self.global_param_list = sorted([k for k in self.param_dict.keys()
                                          if k == k.lower() and k != 'non_fitting_values'])
 
         self.define_range()
 
-        # register the strategy and extend the parameter list
-        # to cover all given elements
-        #for strat_name in fit_strategy_list:
-        #    strategy = extract_strategy(self.param_dict, strat_name)
-            # register the strategy and extend the parameter list
-            # to cover all given elements
-        #    register_strategy(strat_name, strategy)
-            #set_parameter_bound(self.param_dict, strat_name)
+        #  register the strategy and extend the parameter list
+        #  to cover all given elements
+        # for strat_name in fit_strategy_list:
+        #     strategy = extract_strategy(self.param_dict, strat_name)
+        #     #  register the strategy and extend the parameter list
+        #     #  to cover all given elements
+        #     register_strategy(strat_name, strategy)
+        #     set_parameter_bound(self.param_dict, strat_name)
 
-        # define element_adjust as fixed
-        #self.param_dict = define_param_bound_type(self.param_dict)
+        #  define element_adjust as fixed
+        # self.param_dict = define_param_bound_type(self.param_dict)
 
     def exp_data_update(self, change):
         """
@@ -375,7 +485,7 @@ class Fit1D(Atom):
             This is the dictionary that gets passed to a function
             with the @observe decorator
         """
-        self.data_all = np.asarray(change['value'])
+        self.data_all = change['value']
 
     def filename_update(self, change):
         """
@@ -396,21 +506,21 @@ class Fit1D(Atom):
     def update_strategy1(self, change):
         self.all_strategy.update({'strategy1': change['value']})
         if change['value']:
-            logger.info('Strategy at step 1 is: {}'.
+            logger.info('Setting strategy (preset) for step 1: {}'.
                         format(fit_strategy_list[change['value']-1]))
 
     @observe('fit_strategy2')
     def update_strategy2(self, change):
         self.all_strategy.update({'strategy2': change['value']})
         if change['value']:
-            logger.info('Strategy at step 2 is: {}'.
+            logger.info('Setting strategy (preset) for step 2: {}'.
                         format(fit_strategy_list[change['value']-1]))
 
     @observe('fit_strategy3')
     def update_strategy3(self, change):
         self.all_strategy.update({'strategy3': change['value']})
         if change['value']:
-            logger.info('Strategy at step 3 is: {}'.
+            logger.info('Setting strategy (preset) for step 3: {}'.
                         format(fit_strategy_list[change['value']-1]))
 
     @observe('fit_strategy4')
@@ -441,29 +551,34 @@ class Fit1D(Atom):
                                         self.param_dict['e_linear']['value'])
 
     def get_background(self):
-        self.bg = snip_method(self.y0,
-                              self.param_dict['e_offset']['value'],
-                              self.param_dict['e_linear']['value'],
-                              self.param_dict['e_quadratic']['value'],
-                              width=self.param_dict['non_fitting_values']['background_width'])
+        self.bg = snip_method_numba(self.y0,
+                                    self.param_dict['e_offset']['value'],
+                                    self.param_dict['e_linear']['value'],
+                                    self.param_dict['e_quadratic']['value'],
+                                    width=self.param_dict['non_fitting_values']['background_width'])
 
     def get_profile(self):
         """
         Calculate profile based on current parameters.
         """
-        #self.define_range()
+        # self.define_range()
+
+        #  Do nothing if no data is loaded
+        if self.x0 is None or self.y0 is None:
+            return
+
         self.cal_x, self.cal_spectrum, area_dict = calculate_profile(self.x0,
                                                                      self.y0,
                                                                      self.param_dict,
                                                                      self.element_list)
-        # add escape peak
+        #  add escape peak
         if self.param_dict['non_fitting_values']['escape_ratio'] > 0:
             self.cal_spectrum['escape'] = trim_escape_peak(self.data,
                                                            self.param_dict,
                                                            len(self.y0))
 
         self.cal_y = np.zeros(len(self.cal_x))
-        for k, v in six.iteritems(self.cal_spectrum):
+        for k, v in self.cal_spectrum.items():
             self.cal_y += v
 
         self.residual = self.cal_y - self.y0
@@ -471,13 +586,13 @@ class Fit1D(Atom):
     def fit_data(self, x0, y0):
         fit_num = self.fit_num
         ftol = self.ftol
-        c_weight = 1  #avoid zero point
+        c_weight = 1  # avoid zero point
         MS = ModelSpectrum(self.param_dict, self.element_list)
         MS.assemble_models()
 
-        #weights = 1/(c_weight + np.abs(y0))
+        # weights = 1/(c_weight + np.abs(y0))
         weights = 1/np.sqrt(c_weight + np.abs(y0))
-        #weights /= np.sum(weights)
+        # weights /= np.sum(weights)
         result = MS.model_fit(x0, y0,
                               weights=weights,
                               maxfev=fit_num,
@@ -495,12 +610,12 @@ class Fit1D(Atom):
         The param_dict is extended to cover elemental parameters.
         Use app.precessEvents() for multi-threading.
         """
-        #app = QApplication.instance()
+        # app = QApplication.instance()
         self.define_range()
         self.get_background()
 
-        #PC = ParamController(self.param_dict, self.element_list)
-        #self.param_dict = PC.params
+        # PC = ParamController(self.param_dict, self.element_list)
+        # self.param_dict = PC.params
 
         if self.param_dict['non_fitting_values']['escape_ratio'] > 0:
             self.es_peak = trim_escape_peak(self.data,
@@ -511,29 +626,45 @@ class Fit1D(Atom):
             y0 = self.y0 - self.bg
 
         t0 = time.time()
-        self.fit_info = 'Summed spectrum fitting is in process.'
-        #app.processEvents()
-        #logger.info('-------- '+self.fit_info+' --------')
+        self.fit_info = "Spectrum fitting of the sum spectrum (incident energy "\
+                        f"{self.param_dict['coherent_sct_energy']['value']})."
+        # app.processEvents()
+        # logger.info('-------- '+self.fit_info+' --------')
 
-        for k, v in six.iteritems(self.all_strategy):
+        for k, v in self.all_strategy.items():
             if v:
                 strat_name = fit_strategy_list[v-1]
-                #self.fit_info = 'Fit with {}: {}'.format(k, strat_name)
+                # self.fit_info = 'Fit with {}: {}'.format(k, strat_name)
 
                 logger.info(self.fit_info)
                 strategy = extract_strategy(self.param_dict, strat_name)
-                # register the strategy and extend the parameter list
-                # to cover all given elements
+                #  register the strategy and extend the parameter list
+                #  to cover all given elements
                 register_strategy(strat_name, strategy)
                 set_parameter_bound(self.param_dict, strat_name)
 
                 self.fit_data(self.x0, y0)
                 self.update_param_with_result()
 
-                # calculate r2
+                # The following is a patch for rare cases when fitting results in negative
+                #   areas for some emission lines. These are typically non-existent lines, but
+                #   they should not be automatically eliminated from the list. To prevent
+                #   elimination, set the area to some small positive value.
+                for key, val in self.param_dict.items():
+                    if key.endswith("_area") and val["value"] <= 0.0:
+                        _small_value_for_area = 0.1
+                        logger.warning(
+                            f"Fitting resulted in negative value for '{key}' ({val['value']}). \n"
+                            f"    In order to continue using the emission line in future computations, "
+                            f"the fitted area is set to a small value ({_small_value_for_area}).\n    Delete "
+                            f"the emission line from the list if you know it is not present in "
+                            f"the sample.")
+                        val["value"] = _small_value_for_area  # Some small number
+
+                #  calculate r2
                 self.r2 = cal_r2(y0, self.fit_y)
                 self.assign_fitting_result()
-                #app.processEvents()
+                # app.processEvents()
 
         t1 = time.time()
         logger.warning('Time used for summed spectrum fitting is : {}'.format(t1-t0))
@@ -562,18 +693,65 @@ class Fit1D(Atom):
         self.param_q.append(copy.deepcopy(self.param_dict))
         self.keep_size()
 
-    def output_summed_data_fit(self):
+    def compute_current_rfactor(self, save_fit=True):
+        """
+        Compute current R-factor value. The fitted array is selected
+        based on `save_fit`. The same arrays are selected as in `output_summed_data_fit`
+
+        Parameters
+        ----------
+        save_fit: bool
+            True - use total spectrum fitting data (available after fitting was done),
+            False - use weighted spectral components with weights equal to current parameters.
+
+        Returns
+        -------
+        float or None
+            Value of R-factor or None if R-factor can not be computed.
+        """
+        rf = None
+        # R-factor is for visualization purposes only, so display 0 if it can not be computed.
+        if save_fit:
+            if (self.y0 is not None) and (self.fit_y is not None) and \
+                    (self.y0.shape == self.fit_y.shape):
+                rf = rfactor(self.y0, self.fit_y)
+        else:
+            if (self.param_model.y0 is not None) and (self.param_model.total_y is not None) and \
+                    (self.param_model.y0.shape == self.param_model.total_y.shape):
+                rf = rfactor(self.param_model.y0, self.param_model.total_y)
+        return rf
+
+    def output_summed_data_fit(self, save_fit=True):
         """Save energy, summed data and fitting curve to a file.
         """
-        data = np.array([self.x0, self.y0, self.fit_y])
+        xx = None
+        if self.x0 is not None:
+            a0, a1, a2 = (self.param_dict['e_offset']['value'],
+                          self.param_dict['e_linear']['value'],
+                          self.param_dict['e_quadratic']['value'])
+            xx = a0 + self.x0 * a1 + self.x0 ** 2 * a2
+        if save_fit:
+            logger.info("Saving spectrum after total spectrum fitting.")
+            if (xx is None) or (self.y0 is None) or (self.fit_y is None):
+                msg = "Not enough data to save spectrum/fit data. Total spectrum fitting was not run."
+                raise RuntimeError(msg)
+            data = np.array([self.x0, self.y0, self.fit_y])
+        else:
+            logger.info("Saving spectrum based on loaded or estimated parameters.")
+            if (xx is None) or (self.y0 is None) or (self.param_model.total_y is None):
+                msg = "Not enough data to save spectrum/fit data based on loaded or estimated parameters."
+                raise RuntimeError(msg)
+            data = np.array([xx, self.y0, self.param_model.total_y])
+
         output_fit_name = self.data_title + '_summed_spectrum_fit.txt'
         fpath = os.path.join(self.result_folder, output_fit_name)
         np.savetxt(fpath, data.T)
+        logger.info(f"Spectrum fit data is saved to file '{fpath}'")
 
     def assign_fitting_result(self):
         self.function_num = self.fit_result.nfev
         self.nvar = self.fit_result.nvarys
-        #self.chi2 = np.around(self.fit_result.chisqr, 4)
+        # self.chi2 = np.around(self.fit_result.chisqr, 4)
         self.red_chi2 = np.around(self.fit_result.redchi, 4)
 
     def fit_single_pixel(self):
@@ -581,7 +759,7 @@ class Fit1D(Atom):
         This function performs single pixel fitting.
         Multiprocess is considered.
         """
-        #app = QApplication.instance()
+        # app = QApplication.instance()
         raise_bg = self.raise_bg
         pixel_bin = self.pixel_bin
         comp_elastic_combine = False
@@ -594,60 +772,53 @@ class Fit1D(Atom):
         elif self.pixel_fit_method == 1:
             pixel_fit = 'nonlinear'
 
-        logger.info('-------- Fitting of single pixels starts. --------')
+        logger.info("-------- Fitting of single pixels starts (incident_energy "
+                    f"{self.param_dict['coherent_sct_energy']['value']} keV) --------")
         t0 = time.time()
         self.pixel_fit_info = 'Pixel fitting is in process.'
-        #app.processEvents()
-        self.result_map, calculation_info = single_pixel_fitting_controller(self.data_all,
-                                                                            self.param_dict,
-                                                                            method=pixel_fit,
-                                                                            pixel_bin=pixel_bin,
-                                                                            raise_bg=raise_bg,
-                                                                            comp_elastic_combine=comp_elastic_combine,
-                                                                            linear_bg=linear_bg,
-                                                                            use_snip=use_snip,
-                                                                            bin_energy=bin_energy)
+
+        # app.processEvents()
+        self.result_map, calculation_info = single_pixel_fitting_controller(
+            self.data_all,
+            self.param_dict,
+            method=pixel_fit,
+            pixel_bin=pixel_bin,
+            raise_bg=raise_bg,
+            comp_elastic_combine=comp_elastic_combine,
+            linear_bg=linear_bg,
+            use_snip=use_snip,
+            bin_energy=bin_energy)
 
         t1 = time.time()
         logger.info('Time used for pixel fitting is : {}'.format(t1-t0))
 
-        try:
-            with h5py.File(self.hdf_path, 'r') as f:
-                self.x_data = np.array(f['xrfmap/positions/pos'][0, :, :])
-                self.y_data = np.array(f['xrfmap/positions/pos'][1, :, :])
-
-            # this is consistent with fileIO that x data is fliped.
-            self.x_data = np.fliplr(self.x_data)
-        except KeyError:
-            pass
-        except ValueError:
-            pass
-
-        # get fitted spectrum and save them to figs
+        #  get fitted spectrum and save them to figs
         if self.save_point is True:
             self.pixel_fit_info = 'Saving output ...'
-            #app.processEvents()
+            # app.processEvents()
             elist = calculation_info['fit_name']
             matv = calculation_info['regression_mat']
             results = calculation_info['results']
-            #fit_range = calculation_info['fit_range']
+            # fit_range = calculation_info['fit_range']
             x = calculation_info['energy_axis']
             x = (self.param_dict['e_offset']['value'] +
                  self.param_dict['e_linear']['value']*x +
                  self.param_dict['e_quadratic']['value'] * x**2)
-            data_fit = calculation_info['exp_data']
+            data_fit = calculation_info['input_data']
+            data_sel_indices = calculation_info['data_sel_indices']
 
             p1 = [self.point1v, self.point1h]
             p2 = [self.point2v, self.point2h]
 
-            if self.point2v>0 or self.point2h>0:
+            if self.point2v > 0 or self.point2h > 0:
                 prefix_fname = self.hdf_name.split('.')[0]
                 output_folder = os.path.join(self.result_folder, prefix_fname+'_pixel_fit')
                 if os.path.exists(output_folder) is False:
                     os.mkdir(output_folder)
                 save_fitted_fig(x, matv, results[:, :, 0:len(elist)],
                                 p1, p2,
-                                data_fit, self.param_dict,
+                                data_fit, data_sel_indices,
+                                self.param_dict,
                                 output_folder, use_snip=use_snip)
 
             # the output movie are saved as the same name
@@ -658,13 +829,14 @@ class Fit1D(Atom):
             #                      self.result_folder, prefix=prefix_fname, use_snip=use_snip)
             logger.info('Done with saving fitting plots.')
         try:
-            self.save2Dmap_to_hdf(pixel_fit=pixel_fit)
+            self.save2Dmap_to_hdf(calculation_info=calculation_info, pixel_fit=pixel_fit)
             self.pixel_fit_info = 'Pixel fitting is done!'
-            #app.processEvents()
-            logger.info('-------- Fitting of single pixels is done! --------')
+            # app.processEvents()
         except ValueError:
             logger.warning('Fitting result can not be saved to h5 file.')
-
+        except IOError as ex:
+            logger.warning(f"{ex}")
+        logger.info('-------- Fitting of single pixels is done! --------')
 
     def save_pixel_fitting_to_db(self):
         """Save fitting results to analysis store
@@ -676,8 +848,7 @@ class Fit1D(Atom):
         doc['fitted'] = self.fit_y
         save_data_to_db(self.runid, self.result_map, doc)
 
-
-    def save2Dmap_to_hdf(self, pixel_fit='nnls'):
+    def save2Dmap_to_hdf(self, *, calculation_info=None, pixel_fit='nnls'):
         """
         Save fitted 2D map of elements into hdf file after fitting is done. User
         can choose to interpolate the image based on x,y position or not.
@@ -687,38 +858,30 @@ class Fit1D(Atom):
         pixel_fit : str
             If nonlinear is chosen, more information needs to be saved.
         """
-        if self.map_interpolation is True:
-            logger.info('Interpolating image... ')
-            rangex = self.x_data[0,:]
-            rangey = self.y_data[:,0]
-            start_x = rangex[0]
-            start_y = rangey[0]
-            dimv = self.data_all.shape
-            for k, v in six.iteritems(self.result_map):
-                shapev = [dimv[1], dimv[0]]  # horizontal first, then vertical, different from dim in numpy
-                interp_d = interp1d_scan(shapev, rangex, rangey, start_x, start_y,
-                                         self.x_data, self.y_data, v)
-                interp_d[np.isnan(interp_d)] = 0
-                self.result_map[k] = interp_d
 
         prefix_fname = self.hdf_name.split('.')[0]
         if len(prefix_fname) == 0:
             prefix_fname = 'tmp'
-        if 'det1' in self.data_title:
-            inner_path = 'xrfmap/det1'
-            fit_name = prefix_fname+'_det1_fit'
-        elif 'det2' in self.data_title:
-            inner_path = 'xrfmap/det2'
-            fit_name = prefix_fname+'_det2_fit'
-        elif 'det3' in self.data_title:
-            inner_path = 'xrfmap/det3'
-            fit_name = prefix_fname+'_det3_fit'
-        else:
-            inner_path = 'xrfmap/detsum'
-            fit_name = prefix_fname+ '_fit'
+
+        # Generate the path to computed ROIs in the HDF5 file
+        det_name = "detsum"  # Assume that ROIs are computed using the sum of channels
+        fit_name = f"{prefix_fname}_fit"
+
+        # Search for channel name in the data title. Channels are named
+        #   det1, det2, ... , i.e. 'det' followed by integer number.
+        # The channel name is always located at the end of the ``data_title``.
+        # If the channel name is found, then build the path using this name.
+        srch = re.search("det\d+$", self.data_title)  # noqa: W605
+        if srch:
+            det_name = srch.group(0)
+            fit_name = f"{prefix_fname}_{det_name}_fit"
+        inner_path = f"xrfmap/{det_name}"
 
         # Update GUI so that results can be seen immediately
         self.fit_img[fit_name] = self.result_map
+
+        if not os.path.isfile(self.hdf_path):
+            raise IOError(f"File '{self.hdf_path}' does not exist. Data is not saved to HDF5 file.")
 
         save_fitdata_to_hdf(self.hdf_path, self.result_map, datapath=inner_path)
 
@@ -729,58 +892,136 @@ class Fit1D(Atom):
                                 data_saveas='xrf_fit_error',
                                 dataname_saveas='xrf_fit_error_name')
 
-
+    # TODO: the function 'calculate_roi_sum" should be converted to work with
+    #   DASK arrays and HDF5 datasets if needed, otherwise it can be removed.
+    #   The function was called at the exit of dialog box 'OutputSetup'
+    #   (button 'Output Setup') in the Fit tab. This option is eliminated
+    #   from the new interface.
+    """
     def calculate_roi_sum(self):
-        if self.roi_sum_opt['status'] == True:
+        if self.roi_sum_opt['status'] is True:
             low = int(self.roi_sum_opt['low']*100)
             high = int(self.roi_sum_opt['high']*100)
             logger.info('ROI sum at range ({}, {})'.format(self.roi_sum_opt['low'],
                                                            self.roi_sum_opt['high']))
-            sumv = np.sum(self.data_all[:,:,low:high], axis=2)
-            self.result_map['ROI']=sumv
+            sumv = np.sum(self.data_all[:, :, low:high], axis=2)
+            self.result_map['ROI'] = sumv
             # save to hdf again, this is not optimal
             self.save2Dmap_to_hdf()
+    """
 
-    def output_2Dimage(self, to_tiff=True):
+    def get_latest_single_pixel_fitting_data(self):
+        r"""
+        Returns the latest results of single pixel fitting. The returned results include
+        the name of the scaler (None if no scaler is selected) and the dictionary of
+        the computed XRF maps for selected emission lines.
+        """
+
+        # Find the selected scaler name. Scaler is None if not scaler is selected.
+        scaler_name = None
+        if self.scaler_index > 0:
+            scaler_name = self.scaler_keys[self.scaler_index-1]
+
+        # Result map. If 'None', then no fitting results exists.
+        #   Single pixel fitting must be run
+        result_map = self.result_map.copy()
+
+        return result_map, scaler_name
+
+    def get_selected_fitted_map_data(self):
+        """
+        Returns fitting data selected in XRF Maps tab.
+
+        Returned channel name should be 'sum', 'det1', 'det2' etc. If the selected
+        dataset contains maps computed based on ROIs or only positions and scalers,
+        then returned channel name is "".
+        """
+        image_title = self.img_title
+        plotted_dict = self.dict_to_plot.copy()
+
+        # Recover channel name
+        channel_name = ""  # No name (dictionary with position or scaler data is selected)
+        if image_title.endswith("_fit"):
+            m = re.search(r"_det\d+_fit$", image_title)
+            if m:
+                channel_name = m.group(0).split("_")[1].lower()
+            else:
+                channel_name = "sum"
+
+        # Find the selected scaler name. Scaler is None if not scaler is selected.
+        scaler_name = None
+        if self.scaler_index > 0:
+            scaler_name = self.scaler_keys[self.scaler_index-1]
+
+        return plotted_dict, channel_name, scaler_name
+
+    def output_2Dimage(self, *, results_path=None, dataset_name=None, scaler_name=None,
+                       interpolate_on=None, quant_norm_on=None, param_quant_analysis=None,
+                       file_format="tiff"):
         """Read data from h5 file and save them into either tiff or txt.
 
         Parameters
         ----------
-        to_tiff : str, optional
-            save to tiff or not
+        results_path: str
+            path to the root directory where data is to be saved. Data will be saved
+            in subdirectories inside this directory.
+        dataset_name: str
+            name of the dataset (key in the dictionary `self.img_dict`
+        scaler_name: str
+            name of the scaler, must exist in `self.img_dict`
+        interpolate_on: bool
+            turns interpolation of images to uniform grid ON or OFF
+        quant_norm_on: bool
+            turns quantitative normalization of images on or off
+        param_quant_analysis: ParamQuantitativeAnalysis
+            class that contains methods for quantitative normalization
+        file_format: str
+            output file format, supported values: "tiff" or "txt"
         """
-        scaler_v = None
-        _post_name_folder = "_".join(self.data_title.split('_')[:-1])
-        _name_each_file = "_".join(self.data_title.split('_')[1:])
-        if self.scaler_index > 0:
-            scaler_v = self.scaler_keys[self.scaler_index-1]
-            logger.info('*** Data will be saved with NORMALIZATION '
-                        'from {} ***'.format(scaler_v))
-        if to_tiff:
-            output_n = 'output_tiff_' + _post_name_folder
-            output_full_name = os.path.join(self.result_folder, output_n)
-            # still keep the function of reading data from hdf and saving,
-            # for cases that user wants to output current data in hdf
-            # without rerun fitting again
-            if os.path.exists(self.hdf_path):
-                output_data(self.hdf_path, output_full_name,
-                            norm_name=scaler_v)
-            else:
-                output_data_to_tiff(self.result_map, output_full_name,
-                                    name_append=_name_each_file,
-                                    norm_name=scaler_v)
-            logger.info('Done with saving data {} to tiff files.'.format(output_n))
+        supported_file_formats = ("tiff", "txt")
+        file_format = file_format.lower()
+        if file_format not in supported_file_formats:
+            raise ValueError(f"The value 'file_format={file_format}' is not supported. "
+                             f"Supported values: {supported_file_formats} ")
+
+        if file_format == "tiff":
+            dir_prefix = "output_tiff_"
         else:
-            output_n = 'output_txt_' + _post_name_folder
-            output_full_name = os.path.join(self.result_folder, output_n)
-            if os.path.exists(self.hdf_path):
-                output_data(self.hdf_path, output_full_name,
-                            file_format='txt', norm_name=scaler_v)
-            else:
-                output_data_to_tiff(self.result_map, output_full_name,
-                                    name_append=_name_each_file,
-                                    file_format='txt', norm_name=scaler_v)
-            logger.info('Done with saving data {} to txt files.'.format(output_n))
+            dir_prefix = "output_txt_"
+
+        dataset_dict = self.img_dict[dataset_name]
+
+        _post_name_folder = "_".join(self.data_title.split('_')[:-1])
+        output_n = dir_prefix + _post_name_folder
+        output_dir = os.path.join(results_path, output_n)
+
+        # self.img_dict contains ALL loaded datasets, including a separate "positions" dataset
+        if "positions" in self.img_dict:
+            positions_dict = self.img_dict["positions"]
+        else:
+            positions_dict = {}
+
+        if scaler_name is not None:
+            logger.info(f"*** NORMALIZED data is saved. Scaler: '{scaler_name}' ***")
+
+        # Scalers are located in a separate dataset in 'img_dict'. They are also referenced
+        #   in each '_fit' dataset (and in the selected dataset 'self.dict_to_plot')
+        #   The list of scaler names is used to avoid attaching the detector channel name
+        #   to file names that contain scaler data (scalers typically do not depend on
+        #   the selection of detector channels.
+        scaler_dsets = [_ for _ in self.img_dict.keys() if re.search(r"_scaler$", _)]
+        if scaler_dsets:
+            scaler_name_list = list(self.img_dict[scaler_dsets[0]].keys())
+        else:
+            scaler_name_list = None
+
+        output_data(output_dir=output_dir,
+                    interpolate_to_uniform_grid=interpolate_on,
+                    dataset_name=dataset_name, quant_norm=quant_norm_on,
+                    param_quant_analysis=param_quant_analysis,
+                    dataset_dict=dataset_dict, positions_dict=positions_dict,
+                    file_format=file_format, scaler_name=scaler_name,
+                    scaler_name_list=scaler_name_list)
 
     def save_result(self, fname=None):
         """
@@ -802,21 +1043,34 @@ class Fit1D(Atom):
         try:
             with open(filepath, 'w') as myfile:
                 myfile.write('\n {:<10} \t {} \t {}'.format('name', 'summed area', 'error in %'))
-                for k, v in six.iteritems(self.comps):
+                for k, v in self.comps.items():
                     if k == 'background':
                         continue
                     for name in area_list:
                         if k.lower() in name.lower():
-                            errorv = self.fit_result.params[name].stderr/(self.fit_result.params[name].value+1e-8)
-                            errorv *= 100
-                            errorv = np.round(errorv, 3)
-                            myfile.write('\n {:<10} \t {} \t {}'.format(k, np.round(np.sum(v), 3), str(errorv)+'%'))
+                            std_error = self.fit_result.params[name].stderr
+                            if std_error is None:
+                                # Do not print 'std_error' if it is not computed by lmfit
+                                errorv_s = ''
+                            else:
+                                errorv = std_error / (self.fit_result.params[name].value + 1e-8)
+                                errorv *= 100
+                                errorv = np.round(errorv, 3)
+                                errorv_s = f"{errorv}%"
+                            myfile.write('\n {:<10} \t {} \t {}'.format(k, np.round(np.sum(v), 3), errorv_s))
                 myfile.write('\n\n')
-                myfile.write(lmfit.fit_report(self.fit_result, sort_pars=True))
+
+                # Print the report from lmfit
+                # Remove strings (about 50%) on the variables that stayed at initial value
+                report = lmfit.fit_report(self.fit_result, sort_pars=True)
+                report = report.split('\n')
+                report = [s for s in report if 'at initial value' not in s and '##' not in s]
+                report = '\n'.join(report)
+                myfile.write(report)
+
                 logger.warning('Results are saved to {}'.format(filepath))
         except FileNotFoundError:
             print("Summed spectrum fitting results are not saved.")
-
 
     def update_name_list(self):
         """
@@ -838,10 +1092,11 @@ class Fit1D(Atom):
     def create_EC_list(self, element_list):
         temp_dict = OrderedDict()
         for e in element_list:
-            if '-' in e:  # pileup peaks
-                e1, e2 = e.split('-')
-                energy = float(get_energy(e1))+float(get_energy(e2))
-
+            if e == "":
+                pass
+            elif '-' in e:  # pileup peaks
+                energy = self.param_model.get_pileup_peak_energy(e)
+                energy = f"{energy:.4f}"
                 ps = PreFitStatus(z=get_Z(e),
                                   energy=str(energy), norm=1)
                 temp_dict[e] = ps
@@ -913,12 +1168,12 @@ def combine_lines(components, element_list, background):
         if len(e) <= 4:
             e_temp = e.split('_')[0]
             intensity = 0
-            for k, v in six.iteritems(components):
+            for k, v in components.items():
                 if (e_temp in k) and (e not in k):
                     intensity += v
             new_components[e] = intensity
         elif 'user' in e.lower():
-            for k, v in six.iteritems(components):
+            for k, v in components.items():
                 if e in k:
                     new_components[e] = v
         else:
@@ -949,7 +1204,7 @@ def extract_strategy(param, name):
         with given strategy as value
     """
     param_new = copy.deepcopy(param)
-    return {k: v[name] for k, v in six.iteritems(param_new)
+    return {k: v[name] for k, v in param_new.items()
             if k != 'non_fitting_values'}
 
 
@@ -957,7 +1212,7 @@ def define_param_bound_type(param,
                             strategy_list=['adjust_element2, adjust_element3'],
                             b_type='fixed'):
     param_new = copy.deepcopy(param)
-    for k, v in six.iteritems(param_new):
+    for k, v in param_new.items():
         for data in strategy_list:
             if data in list(v.keys()):
                 param_new[k][data] = b_type
@@ -1161,7 +1416,7 @@ def bin_data_energy3D(data, bin_step=2, sum_data=False):
         new_len = data.shape[2]/2
         new_data1 = data[:, :, ::2]
         new_data2 = data[:, :, 1::2]
-        if sum_data == True:
+        if sum_data is True:
             return (new_data1[:, :, :new_len] +
                     new_data2[:, :, :new_len])/bin_step
         else:
@@ -1171,10 +1426,10 @@ def bin_data_energy3D(data, bin_step=2, sum_data=False):
         new_data1 = data[:, :, ::3]
         new_data2 = data[:, :, 1::3]
         new_data3 = data[:, :, 2::3]
-        if sum_data == True:
+        if sum_data is True:
             return (new_data1[:, :, :new_len] +
                     new_data2[:, :, :new_len] +
-                    new_data3[:, :, :new_len] )/bin_step
+                    new_data3[:, :, :new_len])/bin_step
         else:
             return new_data1[:, :, :new_len]
     elif bin_step == 4:
@@ -1183,7 +1438,7 @@ def bin_data_energy3D(data, bin_step=2, sum_data=False):
         new_data2 = data[:, :, 1::4]
         new_data3 = data[:, :, 2::4]
         new_data4 = data[:, :, 3::4]
-        if sum_data == True:
+        if sum_data is True:
             return (new_data1[:, :, :new_len] +
                     new_data2[:, :, :new_len] +
                     new_data3[:, :, :new_len] +
@@ -1224,60 +1479,79 @@ def calculate_area(e_select, matv, results,
     param : dict
         parameters of fitting
     first_peak_area : Bool, optional
-        get overal peak area or only the first peak area, such as Ar_Ka1
+        get overall peak area or only the first peak area, such as Ar_Ka1
 
     Returns
     -------
     dict :
         dict of each 2D elemental distribution
     """
-    total_list = e_select + ['snip_bkg'] + ['r2_adjust']
+    total_list = e_select + ['snip_bkg', 'r_factor', 'sel_cnt', 'total_cnt']
     mat_sum = np.sum(matv, axis=0)
 
-    result_map = dict()
-    for i in range(len(e_select)):
-        if first_peak_area is not True:
-            result_map.update({total_list[i]: results[:, :, i]*mat_sum[i]})
-        else:
-            if total_list[i] not in K_LINE+L_LINE+M_LINE:
-                ratio_v = 1
-            else:
-                ratio_v = get_branching_ratio(total_list[i],
-                                              param['coherent_sct_energy']['value'])
-            result_map.update({total_list[i]: results[:, :, i]*mat_sum[i]*ratio_v})
+    if len(total_list) != results.shape[2]:
+        logger.error(f"The number of features in the list ({len(total_list)} "
+                     f"is not equal to the number of features in the 'results' array "
+                     f"({results.shape[2]}). This issue needs to be investigated,"
+                     f"since some of the generated XRF maps may be invalid.")
 
-    # add background and res
-    result_map.update({total_list[-2]: results[:, :, -2]})
-    result_map.update({total_list[-1]: results[:, :, -1]})
+    result_map = dict()
+    for i, eline in enumerate(total_list):
+        if i < len(e_select):
+            # We are processing the component due to emission line (and may be
+            #   additional constant spectrum representing background)
+            if first_peak_area is not True:
+                result_map.update({total_list[i]: results[:, :, i]*mat_sum[i]})
+            else:
+                if total_list[i] not in K_LINE+L_LINE+M_LINE:
+                    ratio_v = 1
+                else:
+                    ratio_v = get_branching_ratio(total_list[i],
+                                                  param['coherent_sct_energy']['value'])
+                result_map.update({total_list[i]: results[:, :, i]*mat_sum[i]*ratio_v})
+        else:
+            # We are just copying additional computed data
+            result_map.update({eline: results[:, :, i]})
 
     return result_map
 
 
 def save_fitted_fig(x_v, matv, results,
-                    p1, p2, data_all, param_dict,
+                    p1, p2, data_all, data_sel_indices, param_dict,
                     result_folder, use_snip=False):
     """
-    Save single pixel fitting resutls to figs.
+    Save single pixel fitting results to figs.
+    `data_all` can be numpy array, Dask array or RawHDF5Dataset.
     """
+    logger.info(f"Saving plots of the fitted data to file. "
+                f"Selection: {tuple(p1)} .. {tuple(p2)}")
+
+    # Convert the 'data_all', which can be numpy array, Dask array or
+    #   RawHDF5Dataset into Dask array, so that it could be treated uniformly
+    data_all_dask, file_obj = prepare_xrf_map(data_all)
+    # Selection (indices of the processed interval) of `data_all` along axis 2
+    d_start, d_stop = data_sel_indices
+    # 'file_obj' must remain alive until the function exits
+
     low_limit_v = 0.5
 
     fig, ax = plt.subplots(nrows=1, ncols=1)
     ax.set_xlabel('Energy [keV]')
     ax.set_ylabel('Counts')
-    max_v = np.max(data_all[p1[0]:p2[0], p1[1]:p2[1], :])
+    max_v = da.max(data_all_dask[p1[0]:p2[0], p1[1]:p2[1], d_start:d_stop]).compute()
 
     fitted_sum = None
     for m in range(p1[0], p2[0]):
         for n in range(p1[1], p2[1]):
-            data_y = data_all[m, n, :]
+            data_y = data_all_dask[m, n, d_start:d_stop].compute()
 
             fitted_y = np.sum(matv*results[m, n, :], axis=1)
             if use_snip is True:
-                bg = snip_method(data_y,
-                                 param_dict['e_offset']['value'],
-                                 param_dict['e_linear']['value'],
-                                 param_dict['e_quadratic']['value'],
-                                 width=param_dict['non_fitting_values']['background_width'])
+                bg = snip_method_numba(data_y,
+                                       param_dict['e_offset']['value'],
+                                       param_dict['e_linear']['value'],
+                                       param_dict['e_quadratic']['value'],
+                                       width=param_dict['non_fitting_values']['background_width'])
                 fitted_y += bg
 
             if fitted_sum is None:
@@ -1299,7 +1573,7 @@ def save_fitted_fig(x_v, matv, results,
             plt.savefig(output_path)
 
     ax.cla()
-    sum_y = np.sum(data_all[p1[0]:p2[0], p1[1]:p2[1], :], axis=(0, 1))
+    sum_y = da.sum(data_all_dask[p1[0]:p2[0], p1[1]:p2[1], d_start:d_stop], axis=(0, 1)).compute()
     ax.set_title('Summed spectrum from point ({},{}) '
                  'to ({},{})'.format(p1[0], p1[1], p2[0], p2[1]))
     ax.set_xlabel('Energy [keV]')
@@ -1312,6 +1586,8 @@ def save_fitted_fig(x_v, matv, results,
     fit_sum_name = 'pixel_sum_'+str(p1[0])+'-'+str(p1[1])+'_'+str(p2[0])+'-'+str(p2[1])+'.png'
     output_path = os.path.join(result_folder, fit_sum_name)
     plt.savefig(output_path)
+
+    logger.info(f"Fitted data is saved to the directory '{result_folder}'")
 
 
 def save_fitted_as_movie(x_v, matv, results,
@@ -1332,13 +1608,13 @@ def save_fitted_as_movie(x_v, matv, results,
     l1,  = ax.plot(x_v,  x_v, label='exp', linestyle='-', marker='.')
     l2,  = ax.plot(x_v,  x_v, label='fit', color='red', linewidth=2)
 
-    fitted_sum = None
+    # fitted_sum = None
     plist = []
     for v in range(total_n):
         m = v / data_all.shape[1]
         n = v % data_all.shape[1]
-        if m>=p1[0] and m<=p2[0] and n>=p1[1] and n<=p2[1]:
-            plist.append((m,n))
+        if m >= p1[0] and m <= p2[0] and n >= p1[1] and n <= p2[1]:
+            plist.append((m, n))
 
     def update_img(p_val):
         m = p_val[0]
@@ -1347,15 +1623,15 @@ def save_fitted_as_movie(x_v, matv, results,
 
         fitted_y = np.sum(matv*results[m, n, :], axis=1)
         if use_snip is True:
-            bg = snip_method(data_y,
-                             param_dict['e_offset']['value'],
-                             param_dict['e_linear']['value'],
-                             param_dict['e_quadratic']['value'],
-                             width=param_dict['non_fitting_values']['background_width'])
+            bg = snip_method_numba(data_y,
+                                   param_dict['e_offset']['value'],
+                                   param_dict['e_linear']['value'],
+                                   param_dict['e_quadratic']['value'],
+                                   width=param_dict['non_fitting_values']['background_width'])
             fitted_y += bg
 
         ax.set_title('Single pixel fitting for point ({}, {})'.format(m, n))
-        #ax.set_ylim(low_limit_v, max_v*2)
+        # ax.set_ylim(low_limit_v, max_v*2)
         l1.set_ydata(data_y)
         l2.set_ydata(fitted_y)
         return l1, l2
@@ -1399,16 +1675,16 @@ def fit_per_line_nnls(row_num, data,
         fitting values for all the elements at a given row. Background is
         calculated as a summed value. Also residual is included.
     """
-    logger.info('Row number at {}'.format(row_num))
+    logger.debug(f"Row number at {row_num}")
     out = []
     bg_sum = 0
     for i in range(data.shape[0]):
         if use_snip is True:
-            bg = snip_method(data[i, :],
-                             param['e_offset']['value'],
-                             param['e_linear']['value'],
-                             param['e_quadratic']['value'],
-                             width=param['non_fitting_values']['background_width'])
+            bg = snip_method_numba(data[i, :],
+                                   param['e_offset']['value'],
+                                   param['e_linear']['value'],
+                                   param['e_quadratic']['value'],
+                                   width=param['non_fitting_values']['background_width'])
             y = data[i, :] - bg
             bg_sum = np.sum(bg)
 
@@ -1417,7 +1693,11 @@ def fit_per_line_nnls(row_num, data,
 
         result, res = nnls_fit(y, matv, weights=None)
         sst = np.sum((y-np.mean(y))**2)
-        r2_adjusted = 1 - res/(num_data-num_feature-1)/(sst/(num_data-1))
+        if not math.isclose(sst, 0, abs_tol=1e-20):
+            r2_adjusted = 1 - res / (num_data - num_feature - 1) / (sst / (num_data - 1))
+        else:
+            # This happens if all elements of 'y' are equal (most likely == 0)
+            r2_adjusted = 0
         result = list(result) + [bg_sum, r2_adjusted]
         out.append(result)
     return np.array(out)
@@ -1449,7 +1729,32 @@ def fit_pixel_multiprocess_nnls(exp_data, matv, param,
     num_processors_to_use = multiprocessing.cpu_count()
 
     logger.info('cpu count: {}'.format(num_processors_to_use))
-    pool = multiprocessing.Pool(num_processors_to_use)
+
+    # TODO: find better permanent solution for issue with multiprocessing on Catalina MacOS
+    # =======================================================================================
+    # The following is a temporary patch for the issue with multiprocessing on Catalina MacOS.
+    # The issue is solved by disabling multiprocessing if current OS is Catalina MacOS.
+    # The code will change when the better solution is found.
+
+    # Check if the OS is MacOS Catalina (10.15) or older
+    disable_multiprocessing = False
+    try:
+        os_version = platform.mac_ver()[0]
+        # 'os_version' is an empty string if the system is not MacOS
+        # os_version has format similar to '10.15.3', MacOS Catalina is 10.15
+        if os_version and (LooseVersion(os_version) >= LooseVersion("10.15")):
+            disable_multiprocessing = True
+    except Exception as ex:
+        logger.error(f"Error occurred while checking the version of MacOS: {ex}")
+
+    if disable_multiprocessing:
+        pool = multiprocessing.pool.ThreadPool(num_processors_to_use)
+        logger.warning("Multiprocessing is currently not supported when running PyXRF in MacOS Catalina. "
+                       "Computations are executed in multithreading mode instead.")
+    else:
+        pool = multiprocessing.Pool(num_processors_to_use)
+        logger.info("Computations are executed in multiprocessing mode.")
+
     n_data, n_feature = matv.shape
 
     if lambda_reg > 0:
@@ -1474,7 +1779,7 @@ def fit_pixel_multiprocess_nnls(exp_data, matv, param,
     # chop data back
     if lambda_reg > 0:
         matv = matv[:-n_feature, :]
-        exp_data = exp_data[:,:,:-n_feature]
+        exp_data = exp_data[:, :, :-n_feature]
 
     return np.asarray(results)
 
@@ -1490,12 +1795,11 @@ def residual_nonlinear_fit(pars, x, data=None, reg_mat=None):
 
 def fit_pixel_nonlinear_per_line(row_num, data, x0,
                                  param, reg_mat,
-                                 use_snip):
-                                 #c_weight, fit_num, ftol):
+                                 use_snip):  # c_weight, fit_num, ftol):
 
-    c_weight = 1
-    fit_num = 100
-    ftol = 1e-3
+    # c_weight = 1
+    # fit_num = 100
+    # ftol = 1e-3
 
     elist = param['non_fitting_values']['element_list'].split(', ')
     elist = [e.strip(' ') for e in elist]
@@ -1509,11 +1813,11 @@ def fit_pixel_nonlinear_per_line(row_num, data, x0,
     snip_bg = 0
     for i in range(data.shape[0]):
         if use_snip is True:
-            bg = snip_method(data[i, :],
-                             param['e_offset']['value'],
-                             param['e_linear']['value'],
-                             param['e_quadratic']['value'],
-                             width=param['non_fitting_values']['background_width'])
+            bg = snip_method_numba(data[i, :],
+                                   param['e_offset']['value'],
+                                   param['e_linear']['value'],
+                                   param['e_quadratic']['value'],
+                                   width=param['non_fitting_values']['background_width'])
             y0 = data[i, :] - bg
             snip_bg = np.sum(bg)
         else:
@@ -1525,12 +1829,13 @@ def fit_pixel_nonlinear_per_line(row_num, data, x0,
 
         result = lmfit.minimize(residual_nonlinear_fit,
                                 fit_params, args=(x0,),
-                                kws={'data':y0, 'reg_mat':reg_mat})
+                                kws={'data': y0, 'reg_mat': reg_mat})
+
         # result = MS.model_fit(x0, y0,
         #                       weights=1/np.sqrt(c_weight+y0),
         #                       maxfev=fit_num,
         #                       xtol=ftol, ftol=ftol, gtol=ftol)
-        #namelist = list(result.keys())
+        # namelist = list(result.keys())
         temp = {}
         temp['value'] = [result.params[v].value for v in list(result.params.keys())]
         temp['err'] = [result.params[v].stderr for v in list(result.params.keys())]
@@ -1587,23 +1892,23 @@ def get_area_and_error_nonlinear_fit(elist, fit_results, reg_mat):
     for name in elist:
         area_dict[name] = np.zeros([len(fit_results), len(fit_results[0])])
         error_dict[name] = np.zeros([len(fit_results), len(fit_results[0])])
-    #area_dict = OrderedDict({name:np.zeros([len(fit_results), len(fit_results[0])]) for name in elist})
-    #error_dict = OrderedDict({name:np.zeros([len(fit_results), len(fit_results[0])]) for name in elist})
+    # area_dict = OrderedDict({name:np.zeros([len(fit_results), len(fit_results[0])]) for name in elist})
+    # error_dict = OrderedDict({name:np.zeros([len(fit_results), len(fit_results[0])]) for name in elist})
     area_dict['snip_bg'] = np.zeros([len(fit_results), len(fit_results[0])])
     weights_mat = np.zeros([len(fit_results), len(fit_results[0]), len(error_dict)])
 
     for i in range(len(fit_results)):
         for j in range(len(fit_results[0])):
-            for m, v in enumerate(six.iterkeys(area_dict)):
-                if v=='snip_bg':
+            for m, v in enumerate(area_dict.keys()):
+                if v == 'snip_bg':
                     area_dict[v][i, j] = fit_results[i][j]['snip_bg']
                 else:
                     area_dict[v][i, j] = fit_results[i][j]['value'][m]
                     error_dict[v][i, j] = fit_results[i][j]['err'][m]
-                    weights_mat[i,j,m] = fit_results[i][j]['value'][m]
+                    weights_mat[i, j, m] = fit_results[i][j]['value'][m]
 
-    for i,v in enumerate(six.iterkeys(area_dict)):
-        if v=='snip_bg':
+    for i, v in enumerate(area_dict.keys()):
+        if v == 'snip_bg':
             continue
         area_dict[v] *= mat_sum[i]
         error_dict[v] *= mat_sum[i]
@@ -1617,30 +1922,36 @@ def single_pixel_fitting_controller(input_data, parameter,
                                     comp_elastic_combine=False,
                                     linear_bg=False,
                                     use_snip=True,
-                                    bin_energy=1):
+                                    bin_energy=1,
+                                    dask_client=None):
     """
     Parameters
     ----------
-    input_data : array
+    input_data: array
         3D array of spectrum
-    parameter : dict
+    parameter: dict
         parameter for fitting
-    incident_energy : float, optional
+    incident_energy: float, optional
         incident beam energy in KeV
-    method : str, optional
+    method: str, optional
         fitting method, default as nnls
-    pixel_bin : int, optional
+    pixel_bin: int, optional
         bin pixel as 2by2, or 3by3
-    raise_bg : int, optional
+    raise_bg: int, optional
         add a constant value to each spectrum, better for fitting
-    comp_elastic_combine : bool, optional
+    comp_elastic_combine: bool, optional
         combine elastic and compton as one component for fitting
-    linear_bg : bool, optional
+    linear_bg: bool, optional
         use linear background instead of snip
-    use_snip : bool, optional
+    use_snip: bool, optional
         use snip method to remove background
-    bin_energy : int, optional
+    bin_energy: int, optional
         bin spectrum with given value
+    dask_client: dask.distributed.Client
+        Dask client object. If None, then Dask client is created automatically.
+        If a batch of files is processed, then creating Dask client and
+        passing the reference to it to the processing functions will save
+        execution time: `client = Client(processes=True, silence_logs=logging.ERROR)`
 
     Returns
     -------
@@ -1651,18 +1962,33 @@ def single_pixel_fitting_controller(input_data, parameter,
     """
     param = copy.deepcopy(parameter)
     if incident_energy is not None:
-        param['coherent_sct_amplitude']['value'] = incident_energy
-    # cut data into proper range
-    x, exp_data, fit_range = get_cutted_spectrum_in3D(input_data,
-                                                      param['non_fitting_values']['energy_bound_low']['value'],
-                                                      param['non_fitting_values']['energy_bound_high']['value'],
-                                                      param['e_offset']['value'],
-                                                      param['e_linear']['value'])
+        param['coherent_sct_energy']['value'] = incident_energy
+
+    n_bin_low, n_bin_high = get_energy_bin_range(
+        num_energy_bins=input_data.shape[2],
+        low_e=param['non_fitting_values']['energy_bound_low']['value'],
+        high_e=param['non_fitting_values']['energy_bound_high']['value'],
+        e_offset=param['e_offset']['value'],
+        e_linear=param['e_linear']['value'])
+
+    n_bin = np.arange(n_bin_low, n_bin_high)
 
     # calculate matrix for regression analysis
     elist = param['non_fitting_values']['element_list'].split(', ')
     elist = [e.strip(' ') for e in elist]
-    e_select, matv, e_area = construct_linear_model(x, param, elist)
+    e_select, matv, e_area = construct_linear_model(n_bin, param, elist)
+
+    # The initial list of elines may contain lines that are not activated for the incident beam
+    #   energy. This always happens for at least one line when batches of XRF scans obtained for
+    #   the range of beam energies are fitted for the same selection of emission lines to generate
+    #   XANES amps. In such experiments, the line of interest is typically not activated at the
+    #   lower energies of the band. It is impossible to include non-activated lines in the linear
+    #   model. In order to make processing results consistent throughout the batch (contain the
+    #   same set of emission lines), the non-activated lines are represented by maps filled with zeros.
+    elist_non_activated = list(set(elist) - set(e_select))
+    if elist_non_activated:
+        logger.warning("Some of the emission lines in the list are not activated: "
+                       f"{elist_non_activated} at {param['coherent_sct_energy']['value']} keV.")
 
     if comp_elastic_combine is True:
         e_select = e_select[:-1]
@@ -1676,48 +2002,80 @@ def single_pixel_fitting_controller(input_data, parameter,
         e_select.append('const_bkg')
 
         matv_old = np.array(matv)
-        matv = np.ones([matv_old.shape[0], matv_old.shape[1]+1])
+        matv = np.ones([matv_old.shape[0], matv_old.shape[1] + 1])
         matv[:, :-1] = matv_old
 
     logger.info('Matrix used for linear fitting has components: {}'.format(e_select))
 
-    # add const background, so nnls works better for values above zero
+    def _log_unsupported_option(option):
+        logger.warning(f"Option '{option}' is enabled. This option is not supported "
+                       f"and will be ignored. Disable the option to eliminate this warning.")
+
     if raise_bg > 0:
-        exp_data += raise_bg
+        _log_unsupported_option(f"raise_bg == {raise_bg}")
+
+    # add const background, so nnls works better for values above zero
+    # if raise_bg > 0:
+    #     exp_data += raise_bg
+
+    if pixel_bin > 1:
+        _log_unsupported_option(f"pixel_bin == {pixel_bin}")
 
     # bin data based on nearest pixels, only two options
-    if pixel_bin in [4, 9]:
-        logger.info('Bin pixel data with parameter: {}'.format(pixel_bin))
-        exp_data = bin_data_spacial(exp_data, bin_size=int(np.sqrt(pixel_bin)))
-        # exp_data = bin_data_pixel(exp_data, nearest_n=pixel_bin)  # return a copy of data
+    # if pixel_bin in [4, 9]:
+    #     logger.info('Bin pixel data with parameter: {}'.format(pixel_bin))
+    #     exp_data = bin_data_spacial(exp_data, bin_size=int(np.sqrt(pixel_bin)))
+    #     # exp_data = bin_data_pixel(exp_data, nearest_n=pixel_bin)  # return a copy of data
 
+    if bin_energy > 1:
+        _log_unsupported_option(f"pixel_bin == {pixel_bin}")
     # bin data based on energy spectrum
-    if bin_energy in [2, 3]:
-        exp_data = conv_expdata_energy(exp_data, width=bin_energy)
+    # if bin_energy in [2, 3]:
+    #     exp_data = conv_expdata_energy(exp_data, width=bin_energy)
 
     # make matrix smaller for single pixel fitting
-    matv /= exp_data.shape[0]*exp_data.shape[1]
+    matv /= input_data.shape[0] * input_data.shape[1]
     # save matrix to analyze collinearity
-    #np.save('mat.npy', matv)
+    # np.save('mat.npy', matv)
     error_map = None
 
-    if method == 'nnls':
-        logger.info('Fitting method: non-negative least squares')
-        lambda_reg = 0.0
-        results = fit_pixel_multiprocess_nnls(exp_data, matv, param,
-                                              use_snip=use_snip, lambda_reg=lambda_reg)
-        # output area of dict
-        result_map = calculate_area(e_select, matv, results,
-                                    param, first_peak_area=False)
-    else:
-        logger.info('Fitting method: nonlinear least squares')
-        matrix_norm = exp_data.shape[0]*exp_data.shape[1]
-        fit_results = fit_pixel_multiprocess_nonlinear(exp_data, x, param, matv/matrix_norm,
-                                                       use_snip=use_snip)
+    if method != 'nnls':
+        logger.warning(f"Fitting using '{method}' is not supported: 'nnls' method will be used instead.")
 
-        result_map, error_map, results = get_area_and_error_nonlinear_fit(e_select,
-                                                                          fit_results,
-                                                                          matv/matrix_norm)
+    logger.info('Fitting method: non-negative least squares')
+
+    snip_param = {
+        "e_offset": param["e_offset"]["value"],
+        "e_linear": param["e_linear"]["value"],
+        "e_quadratic": param["e_quadratic"]["value"],
+        "b_width": param["non_fitting_values"]["background_width"]
+    }
+    results = fit_xrf_map(data=input_data,
+                          data_sel_indices=(n_bin_low, n_bin_high),
+                          matv=matv,
+                          snip_param=snip_param,
+                          use_snip=use_snip,
+                          chunk_pixels=5000,
+                          n_chunks_min=4,
+                          progress_bar=TerminalProgressBar("NNLS fitting"),
+                          client=dask_client)
+
+    # output area of dict
+    result_map = calculate_area(e_select, matv, results,
+                                param, first_peak_area=False)
+
+    # Alternative fitting method (nonlinear fit). Very slow and nobody seems to be using it
+    # logger.info('Fitting method: nonlinear least squares')
+    # matrix_norm = exp_data.shape[0]*exp_data.shape[1]
+    # fit_results = fit_pixel_multiprocess_nonlinear(exp_data, x, param, matv/matrix_norm,
+    #                                               use_snip=use_snip)
+    # result_map, error_map, results = get_area_and_error_nonlinear_fit(e_select,
+    #                                                                  fit_results,
+    #                                                                  matv/matrix_norm)
+
+    # Generate 'zero' maps for the emission lines that were not activated
+    for eline in elist_non_activated:
+        result_map[eline] = np.zeros(shape=input_data.shape[0:2])
 
     calculation_info = dict()
     if error_map is not None:
@@ -1726,52 +2084,57 @@ def single_pixel_fitting_controller(input_data, parameter,
     calculation_info['fit_name'] = e_select
     calculation_info['regression_mat'] = matv
     calculation_info['results'] = results
-    calculation_info['fit_range'] = fit_range
-    calculation_info['energy_axis'] = x
-    calculation_info['exp_data'] = exp_data
+    calculation_info['fit_range'] = (n_bin_low, n_bin_high)
+    calculation_info['energy_axis'] = n_bin
+    # Used to be 'exp_data'(selected data), now it is the full dataset,
+    #   which can be ndarray, Dask array or RawHDF5Dataset. In order
+    #   to get the selected set, 'input_data' must be sliced along axis2
+    #   using 'fit_range' values.
+    calculation_info['input_data'] = input_data
+    calculation_info['data_sel_indices'] = (n_bin_low, n_bin_high)
 
     return result_map, calculation_info
 
 
-def get_cutted_spectrum_in3D(exp_data, low_e, high_e,
-                             e_offset, e_linear):
+def get_energy_bin_range(num_energy_bins, low_e, high_e,
+                         e_offset, e_linear):
     """
-    Cut exp data on the 3rd axis, energy axis.
+    Find the bin numbers in the range `0 .. num_energy_bins-1` that correspond
+    to the selected energy range `low_e` .. `high_e`.
+
+    The range `(n_low:n_high)` includes the bin with energies `low_e` .. `high_e`
+    (note that `n_high` is not part of the range).
+
     Parameters
     ----------
-    exp_data : 3D array
+    num_energy_bins : int
+        number of energy bins
     low_e : float
-        low energy bound in KeV
+        low energy bound, in keV
     high_e : float
-        high energy bound in KeV
+        high energy bound, in keV
     e_offset : float
-        offset term in energy calibration
+        offset term in energy calibration (energy for bin #0), keV
     e_linear : float
         linear term in energy calibration
+
     Returns
     -------
-    x : array
-        channel data
-    data : 3D array
-        after cutting into the correct range
-    list :
-        fitting range
+    n_low: int
+        the number of the bin that corresponds to `low_e`
+    n_high: int
+        the number of the bin above the one that corresponds to `high_e`
     """
 
-    # cut range
-    data = np.array(exp_data)
-    y0 = data[0, 0, :]
-    x0 = np.arange(len(y0))
+    v_low = (low_e - e_offset) / e_linear
+    v_high = (high_e - e_offset) / e_linear + 1
 
-    # transfer energy value back to channel value
-    lowv = (low_e - e_offset) / e_linear
-    highv = (high_e - e_offset) / e_linear
-    lowv = int(lowv)
-    highv = int(highv)
-    x, y = trim(x0, y0, lowv, highv)
+    def _get_index(v):
+        return int(np.clip(v, a_min=0, a_max=num_energy_bins))
 
-    data = data[:, :, lowv: highv+1]
-    return x, data, [lowv, highv]
+    n_low, n_high = _get_index(v_low), _get_index(v_high)
+
+    return n_low, n_high
 
 
 def get_branching_ratio(elemental_line, energy):
@@ -1825,17 +2188,17 @@ def roi_sum_calculation(dir_path, file_prefix, fileID,
         roi sum for all given elements
     """
     num_str = '{:03d}'.format(fileID)
-    #logger.info('File number is {}'.format(fileID))
+    # logger.info('File number is {}'.format(fileID))
     filename = file_prefix + num_str
     file_path = os.path.join(dir_path, filename)
     with h5py.File(file_path, 'r') as f:
         data = f[interpath][:]
 
     result_map = dict()
-    #for v in six.iterkeys(element_dict):
-    #    result_map[v] = np.zeros([datas[0], datas[1]])
+    # for v in element_dict.keys():
+    #     result_map[v] = np.zeros([datas[0], datas[1]])
 
-    for k, v in six.iteritems(element_dict):
+    for k, v in element_dict.items():
         result_map[k] = np.sum(data[:, :, v[0]: v[1]], axis=2)
 
     return result_map
@@ -1921,84 +2284,3 @@ def get_cs(elemental_line, eng=12, norm=False, round_n=2):
         return np.around(sumv/e.csb(eng)[name_label], round_n)
     else:
         return np.around(sumv, round_n)
-
-
-def fly2d_grid(dimv, rangex, rangey, start_x, start_y,
-               x_data=None, y_data=None):
-    '''Get ideal gridded points for a 2D flyscan.
-    .. warning: dimv[dimh, dimv] here is different from tradition dim in python which is [dimv, dimh].
-
-    Parameters
-    ----------
-    dimv : array
-        horizontal first, then vertical.
-    rangex : array, list
-        range along horizontal direction.
-    rangey : array, list
-        range along vertical direction
-    start_x : float
-        starting value in horizontal direction.
-    start_y : float
-        starting value in vertical direction.
-    '''
-    # try:
-    #     nx, ny = hdr['dimensions']
-    # except ValueError:
-    #     raise ValueError('Not a 2D flyscan (dimensions={})'
-    #                      ''.format(hdr['dimensions']))
-    nx, ny = dimv
-    #rangex, rangey = hdr['scan_range']
-    width = rangex[-1] - rangex[0]
-    height = rangey[-1] - rangey[0]
-
-    #macros = eval(hdr['subscan_0']['macros'], dict(array=np.array))
-    #start_x, start_y = macros['scan_starts']
-    dx = width / nx
-    dy = height / ny
-
-    # original code use dx/2, dy/2, so value of the last column will not be interpolated
-    #grid_x = np.linspace(start_x, start_x + width + dx/2, nx)
-    #grid_y = np.linspace(start_y, start_y + height + dy/2, ny)
-    grid_x = np.linspace(start_x, start_x + width -dx/2, nx)
-    grid_y = np.linspace(start_y, start_y + height -dy/2, ny)
-
-    return grid_x, grid_y
-
-
-def interp1d_scan(dimv, rangex, rangey, start_x, start_y,
-                  x_data, y_data, spectrum, kind='linear',
-                  **kwargs):
-    '''Interpolate a 2D flyscan only over the fast-scanning direction'''
-    #grid_x, grid_y = fly2d_grid(hdr, x_data, y_data, plot=plot_points)
-    grid_x, grid_y = fly2d_grid(dimv, rangex, rangey, start_x, start_y, x_data, y_data)
-    #x_data = fly2d_reshape(hdr, x_data, verbose=False)
-    #grid_x = flip_data(grid_x)
-
-    if False:
-        mesh_x, mesh_y = np.meshgrid(grid_x, grid_y)
-        plt.figure()
-        if x_data is not None and y_data is not None:
-            plt.scatter(x_data, y_data, c='blue', label='actual')
-        plt.scatter(mesh_x, mesh_y, c='red', label='gridded',
-                    alpha=0.5)
-        plt.legend()
-        plt.show()
-
-    spectrum2 = np.zeros_like(spectrum)
-    for row in range(len(grid_y)):
-        spectrum2[row, :] = interp1d(x_data[row, :], spectrum[row, :],
-                                     kind=kind, bounds_error=False,
-                                     **kwargs)(grid_x)
-
-    return spectrum2
-
-
-def interp2d_scan(dimv, rangex, rangey, start_x, start_y,
-                  x_data, y_data, spectrum, kind='linear',
-                  **kwargs):
-    '''Interpolate a 2D flyscan over a grid, borrowed from Ken'''
-
-    new_x, new_y = fly2d_grid(dimv, rangex, rangey, start_x, start_y, x_data, y_data)
-
-    f = interp2d(x_data, y_data, spectrum, kind=kind, **kwargs)
-    return f(new_x, new_y)
