@@ -842,28 +842,6 @@ def map_data2D_srx(run_id_uid, fpath,
         #     config_data['xrf_detector'] = xrf_detector_names
 
         if output_to_file:
-<<<<<<< HEAD
-            print('Saving data to hdf file.')
-            write_db_to_hdf(fpath, data,
-                            start_doc['shape'],
-                            det_list=config_data['xrf_detector'],
-                            pos_list=hdr.start.motors,
-                            scaler_list=config_data['scaler_list'],
-                            fly_type=fly_type,
-                            base_val=config_data['base_value'])  #base value shift for ic
-            if 'xs2' in hdr.start.detectors:
-                print('Saving data to hdf file for second xspress3 detector.')
-                tmp = fpath.split('.')
-                fpath1 = '.'.join([tmp[0]+'_1', tmp[1]])
-                write_db_to_hdf(fpath1, data,
-                                start_doc['shape'],
-                                det_list=config_data['xrf_detector2'],
-                                pos_list=hdr.start.motors,
-                                scaler_list=config_data['scaler_list'],
-                                fly_type=fly_type,
-                                base_val=config_data['base_value'])  #base value shift for ic
-        return data
-=======
             if 'xs' in hdr.start.detectors:
                 logger.info('Saving data to hdf file: Xpress3 detector #1 (three channels).')
                 root, ext = os.path.splitext(fpath)
@@ -915,7 +893,6 @@ def map_data2D_srx(run_id_uid, fpath,
             logger.debug(f"Step scan data was saved to the following files: {fln_list}")
 
         return data_output
->>>>>>> upstream/master
 
     else:
 
@@ -2175,42 +2152,3 @@ def get_data_parallel(data, elist, det_num):
 
     pool.terminate()
     pool.join()
-
-
-def flip_data(input_data, subscan_dims=None):
-    """
-    Flip 2D or 3D array. The flip happens on the second index of shape.
-    .. warning :: This function mutates the input values.
-
-    Parameters
-    ----------
-    input_data : 2D or 3D array.
-
-    Returns
-    -------
-    flipped data
-    """
-    new_data = np.asarray(input_data)
-    data_shape = input_data.shape
-    if len(data_shape) == 2:
-        if subscan_dims is None:
-            new_data[1::2, :] = new_data[1::2, ::-1]
-        else:
-            i = 0
-            for nx, ny in subscan_dims:
-                start = i + 1
-                end = i + ny
-                new_data[start:end:2, :] = new_data[start:end:2, ::-1]
-                i += ny
-
-    if len(data_shape) == 3:
-        if subscan_dims is None:
-            new_data[1::2, :, :] = new_data[1::2, ::-1, :]
-        else:
-            i = 0
-            for nx, ny in subscan_dims:
-                start = i + 1
-                end = i + ny
-                new_data[start:end:2, :, :] = new_data[start:end:2, ::-1, :]
-                i += ny
-    return new_data

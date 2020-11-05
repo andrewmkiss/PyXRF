@@ -1,0 +1,8 @@
+#!/opt/conda_envs/nsls2-analysis-2020-2.0rc8-clone/bin/python
+# -*- coding: utf-8 -*-
+import re
+import sys
+from pyxrf.pyxrf_run import run
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+    sys.exit(run())

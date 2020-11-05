@@ -111,5 +111,11 @@ def run():
     sys.exit(app.exec_())
 
 
+print('\n\n')
+print('************************')
+print('This is a fork of PyXRF!')
+print('************************')
+print('\n\n')
+
 if __name__ == "__main__":
     run()
